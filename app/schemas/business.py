@@ -52,6 +52,17 @@ class UrgeRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+class AffairControlRuleRequest(BaseModel):
+    is_enabled: bool
+
+
+class AffairDecisionRequest(BaseModel):
+    target_status: Literal["待受理", "办理中", "待复核", "已办结", "已退回"]
+    department_id: int | None = None
+    result: str | None = Field(default=None, max_length=4000)
+    opinion: str | None = Field(default=None, max_length=2000)
+
+
 class MetricWindowRequest(BaseModel):
     started_at: str | None = None
     ended_at: str | None = None

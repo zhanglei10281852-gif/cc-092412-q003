@@ -96,13 +96,23 @@ def get_affair(affair_id: int):
 def process_affair(affair_id: int, data: AffairProcess):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT status FROM affairs WHERE id = ?", (affair_id,))
+    cursor.execute("SELECT status, category FROM affairs WHERE id = ?", (affair_id,))
     row = cursor.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="事务不存在")
 
     current_status = row["status"]
     new_status = data.status.value
+
+    controlled = cursor.execute(
+        "SELECT 1 FROM affair_control_rules WHERE category=? AND is_enabled=1",
+        (row["category"],),
+    ).fetchone()
+    if controlled:
+        raise HTTPException(
+            status_code=403,
+            detail="该事务类别已启用职责分离规则，请通过 /api/affair-workflow 携带会话令牌办理"
+        )
 
     valid_transitions = {
         "待受理": ["办理中", "已退回"],

@@ -5,7 +5,7 @@
 ## 主要模块
 
 - 居民档案：登记、查询、更新和关联事务。
-- 事务办理：受理、分派、退回、办结和部门责任查询。
+- 事务办理：受理、分派、退回、办结和部门责任查询；支持按类别配置经办/复核职责分离。
 - 信访流转：签收、分派、办理、审核、复查、催办和流转记录。
 - 公告与部门：公告置顶、分类检索、部门信息及关联业务查看。
 - 身份与权限：用户、角色、细粒度权限、会话令牌、账号停用和会话撤销。
@@ -92,6 +92,22 @@ app/
 tests/             核心、管理接口和原有业务回归测试
 tools/             本地维护脚本
 ```
+
+## 事务职责分离
+
+民政补助等高风险事务类别可启用职责分离规则（需 `affairs.configure` 权限）：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8432/api/affair-workflow/rules/低保 \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"is_enabled": true}'
+```
+
+启用后，该类别在办结前必须由**不同人员**分别完成经办与复核，且两人在决定生效瞬间都必须仍持有 `affairs.write` 权限并处于承办部门的有效任期内，任一方失效都会阻断尚未完成的办结（此时只能退回重办）。受控流转为：受理 → 办理中 → 待复核 → 已办结/已退回；退回重办会开启新的复核轮次，旧轮次证据完整保留。
+
+- 办理接口（携带会话令牌）：`POST /api/affair-workflow/{id}/decisions`，可用 `Idempotency-Key` 请求头防重复点击，同键同体重放返回 200 且只产生一次决定。
+- 事务详情：`GET /api/affair-workflow/{id}` 返回 `controlled`、`current_responsibility`（当前责任）、`pending_reason`（待办原因）、`review_rounds`（各复核轮次）和 `decisions`（完整决定历史）。
+- 未启用规则的类别（`controlled=false`）沿用原有流转，旧接口 `PUT /affairs/{id}/process` 行为不变；受控类别调用旧接口会被拒绝以防止绕过复核。
 
 ## 数据一致性
 

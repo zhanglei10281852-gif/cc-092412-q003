@@ -12,7 +12,71 @@ from app.core.clock import to_storage, utc_now
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "township.db"
 _local = threading.local()
 
-SCHEMA = r''' 
+AFFAIRS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS affairs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL CHECK(category IN ('户籍','社保','医保','低保','建房','计生','其他')),
+    applicant_id INTEGER NOT NULL REFERENCES residents(id),
+    description TEXT,
+    status TEXT NOT NULL DEFAULT '待受理' CHECK(status IN ('待受理','办理中','待复核','已办结','已退回')),
+    department_id INTEGER REFERENCES departments(id),
+    handler TEXT,
+    result TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+AFFAIR_CONTROL_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS affair_control_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL UNIQUE CHECK(category IN ('户籍','社保','医保','低保','建房','计生','其他')),
+    is_enabled INTEGER NOT NULL DEFAULT 1 CHECK (is_enabled IN (0, 1)),
+    created_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS affair_review_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    affair_id INTEGER NOT NULL REFERENCES affairs(id) ON DELETE CASCADE,
+    round_no INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('待复核','复核通过','复核退回')),
+    handler_user_id INTEGER NOT NULL REFERENCES users(id),
+    handler_name TEXT NOT NULL,
+    handler_department_id INTEGER NOT NULL REFERENCES departments(id),
+    result TEXT,
+    handled_at TEXT NOT NULL,
+    reviewer_user_id INTEGER REFERENCES users(id),
+    reviewer_name TEXT,
+    review_opinion TEXT,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(affair_id, round_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_affair_rounds_open ON affair_review_rounds(affair_id, status);
+
+CREATE TABLE IF NOT EXISTS affair_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    affair_id INTEGER NOT NULL REFERENCES affairs(id) ON DELETE CASCADE,
+    round_no INTEGER,
+    action TEXT NOT NULL CHECK(action IN ('accept','submit','approve','return','reopen','complete')),
+    actor_user_id INTEGER,
+    actor_name TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    summary TEXT,
+    request_hash TEXT,
+    idempotency_key TEXT UNIQUE,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_affair_decisions_affair ON affair_decisions(affair_id, id);
+"""
+
+SCHEMA = rf'''
 CREATE TABLE IF NOT EXISTS departments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -95,7 +159,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     outcome TEXT NOT NULL CHECK(outcome IN ('success','denied','failure')),
     before_json TEXT,
     after_json TEXT,
-    metadata_json TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{{}}',
     correlation_id TEXT,
     created_at TEXT NOT NULL
 );
@@ -127,19 +191,8 @@ CREATE TABLE IF NOT EXISTS residents (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS affairs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    category TEXT NOT NULL CHECK(category IN ('户籍','社保','医保','低保','建房','计生','其他')),
-    applicant_id INTEGER NOT NULL REFERENCES residents(id),
-    description TEXT,
-    status TEXT NOT NULL DEFAULT '待受理' CHECK(status IN ('待受理','办理中','已办结','已退回')),
-    department_id INTEGER REFERENCES departments(id),
-    handler TEXT,
-    result TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+{AFFAIRS_TABLE_SQL}
+{AFFAIR_CONTROL_TABLES_SQL}
 
 CREATE TABLE IF NOT EXISTS announcements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,6 +281,7 @@ PERMISSIONS = [
     ("residents.write", "维护居民", "residents", "write"),
     ("affairs.read", "查看事务", "affairs", "read"),
     ("affairs.write", "办理事务", "affairs", "write"),
+    ("affairs.configure", "配置事务职责分离规则", "affairs", "configure"),
     ("petitions.read", "查看信访", "petitions", "read"),
     ("petitions.write", "办理信访", "petitions", "write"),
     ("announcements.write", "维护公告", "announcements", "write"),
@@ -285,6 +339,7 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _rebuild_affairs_table_if_needed(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -307,6 +362,24 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+
+
+def _rebuild_affairs_table_if_needed(connection: sqlite3.Connection) -> None:
+    """旧库 affairs 表的状态 CHECK 不含“待复核”，需要重建一次。"""
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='affairs'").fetchone()
+    if row is not None and "待复核" in (row[0] or ""):
+        return
+    connection.executescript(
+        """
+        ALTER TABLE affairs RENAME TO affairs_legacy;
+        """
+        + AFFAIRS_TABLE_SQL
+        + """
+        INSERT INTO affairs(id,title,category,applicant_id,description,status,department_id,handler,result,created_at,updated_at)
+        SELECT id,title,category,applicant_id,description,status,department_id,handler,result,created_at,updated_at FROM affairs_legacy;
+        DROP TABLE affairs_legacy;
+        """
+    )
 
 
 def migrate_db() -> None:
