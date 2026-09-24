@@ -2,6 +2,8 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import Optional
 from app.database import get_connection
 from app.models import AffairCreate, AffairProcess, AffairStatus
+from app.repositories.business import AffairRepository
+from app.services.affairs import AffairWorkflowService
 
 router = APIRouter(prefix="/affairs", tags=["事务办理"])
 
@@ -75,21 +77,9 @@ def list_affairs(
 
 @router.get("/{affair_id}")
 def get_affair(affair_id: int):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """SELECT a.*, r.name as applicant_name, r.phone as applicant_phone,
-           d.name as department_name, d.manager as department_manager, d.phone as department_phone
-           FROM affairs a
-           LEFT JOIN residents r ON a.applicant_id = r.id
-           LEFT JOIN departments d ON a.department_id = d.id
-           WHERE a.id = ?""",
-        (affair_id,)
-    )
-    row = cursor.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="事务不存在")
-    return dict(row)
+    # 复用职责分离工作流的详情视图：包含当前责任、待办原因、复核轮次与完整决定历史
+    detail = AffairWorkflowService(get_connection()).detail(affair_id)
+    return detail
 
 
 @router.put("/{affair_id}/process")
@@ -107,6 +97,7 @@ def process_affair(affair_id: int, data: AffairProcess):
     valid_transitions = {
         "待受理": ["办理中", "已退回"],
         "办理中": ["已办结", "已退回"],
+        "待复核": [],
         "已退回": ["待受理"],
         "已办结": []
     }
@@ -116,6 +107,16 @@ def process_affair(affair_id: int, data: AffairProcess):
             status_code=400,
             detail=f"状态不允许从'{current_status}'转换到'{new_status}'"
         )
+
+    # 受控类别禁止通过旧接口绕过经办/复核职责分离直接办结
+    if new_status == "已办结":
+        cursor.execute("SELECT category FROM affairs WHERE id = ?", (affair_id,))
+        category_row = cursor.fetchone()
+        if category_row and AffairRepository(get_connection()).is_controlled(category_row["category"]):
+            raise HTTPException(
+                status_code=409,
+                detail="该事务类别已启用职责分离，请通过经办提交与复核接口完成办结"
+            )
 
     if data.department_id is not None:
         cursor.execute("SELECT id FROM departments WHERE id = ?", (data.department_id,))

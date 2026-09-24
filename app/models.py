@@ -21,6 +21,7 @@ class AffairCategory(str, Enum):
 class AffairStatus(str, Enum):
     pending = "待受理"
     processing = "办理中"
+    pending_review = "待复核"
     completed = "已办结"
     rejected = "已退回"
 

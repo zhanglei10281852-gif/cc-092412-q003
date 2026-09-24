@@ -133,13 +133,64 @@ CREATE TABLE IF NOT EXISTS affairs (
     category TEXT NOT NULL CHECK(category IN ('户籍','社保','医保','低保','建房','计生','其他')),
     applicant_id INTEGER NOT NULL REFERENCES residents(id),
     description TEXT,
-    status TEXT NOT NULL DEFAULT '待受理' CHECK(status IN ('待受理','办理中','已办结','已退回')),
+    status TEXT NOT NULL DEFAULT '待受理' CHECK(status IN ('待受理','办理中','待复核','已办结','已退回')),
     department_id INTEGER REFERENCES departments(id),
     handler TEXT,
     result TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 职责分离策略：按事务类别配置进入办结前是否必须经办、复核分离
+CREATE TABLE IF NOT EXISTS affair_review_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL UNIQUE,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- 复核轮次：受控事务每提交一次办理结果开启一轮，退回重办另开新一轮，旧轮次保留
+CREATE TABLE IF NOT EXISTS affair_review_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    affair_id INTEGER NOT NULL REFERENCES affairs(id) ON DELETE CASCADE,
+    round_no INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending_review','approved','returned')),
+    handler_user_id INTEGER REFERENCES users(id),
+    handler_name TEXT NOT NULL,
+    handler_department_id INTEGER,
+    result TEXT,
+    submitted_at TEXT NOT NULL,
+    reviewer_user_id INTEGER REFERENCES users(id),
+    reviewer_name TEXT,
+    review_opinion TEXT,
+    decided_at TEXT,
+    created_at TEXT NOT NULL,
+    closed_at TEXT,
+    UNIQUE(affair_id, round_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_affair_rounds ON affair_review_rounds(affair_id, round_no);
+
+-- 决定证据：经办提交、复核结论等不可变决定；同一轮同一阶段只允许一条有效决定
+CREATE TABLE IF NOT EXISTS affair_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    affair_id INTEGER NOT NULL REFERENCES affairs(id) ON DELETE CASCADE,
+    round_no INTEGER NOT NULL DEFAULT 0,
+    stage TEXT NOT NULL CHECK(stage IN ('handle','review')),
+    decision TEXT NOT NULL CHECK(decision IN ('submitted','approved','returned')),
+    actor_user_id INTEGER REFERENCES users(id),
+    actor_name TEXT NOT NULL,
+    department_id INTEGER,
+    opinion TEXT,
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(affair_id, round_no, stage),
+    UNIQUE(affair_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_affair_decisions ON affair_decisions(affair_id, id);
 
 CREATE TABLE IF NOT EXISTS announcements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,12 +279,19 @@ PERMISSIONS = [
     ("residents.write", "维护居民", "residents", "write"),
     ("affairs.read", "查看事务", "affairs", "read"),
     ("affairs.write", "办理事务", "affairs", "write"),
+    ("affairs.review", "复核事务", "affairs", "review"),
+    ("affairs.policy.write", "配置事务职责分离", "affairs", "policy.write"),
     ("petitions.read", "查看信访", "petitions", "read"),
     ("petitions.write", "办理信访", "petitions", "write"),
     ("announcements.write", "维护公告", "announcements", "write"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
 ]
+
+# 默认纳入职责分离控制的民政补助类事务类别及说明
+DEFAULT_REVIEW_CATEGORIES = {
+    "低保": "民政补助类事务，办结前须由不同人员完成经办与复核",
+}
 
 
 def database_path() -> Path:
@@ -284,6 +342,7 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
+        _migrate_affairs_status(connection)
         connection.executescript(SCHEMA)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
@@ -307,6 +366,47 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+        # 民政补助类默认受控：低保事务进入办结前必须经办、复核分离
+        for category, note in DEFAULT_REVIEW_CATEGORIES.items():
+            connection.execute(
+                "INSERT OR IGNORE INTO affair_review_policies(category,is_active,note,created_at,updated_at) VALUES(?,1,?,?,?)",
+                (category, note, now, now),
+            )
+
+
+def _migrate_affairs_status(connection: sqlite3.Connection) -> None:
+    """旧库 affairs.status 的 CHECK 约束不含“待复核”，需要在新 SCHEMA 建立前重建该表。"""
+    columns = {
+        str(row[1]).lower() for row in connection.execute("PRAGMA table_info(affairs)").fetchall()
+    }
+    if not columns:
+        return
+    check_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='affairs'"
+    ).fetchone()[0]
+    if "待复核" in check_sql:
+        return
+    connection.executescript(
+        """
+        ALTER TABLE affairs RENAME TO affairs_legacy;
+        CREATE TABLE affairs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL CHECK(category IN ('户籍','社保','医保','低保','建房','计生','其他')),
+            applicant_id INTEGER NOT NULL REFERENCES residents(id),
+            description TEXT,
+            status TEXT NOT NULL DEFAULT '待受理' CHECK(status IN ('待受理','办理中','待复核','已办结','已退回')),
+            department_id INTEGER REFERENCES departments(id),
+            handler TEXT,
+            result TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO affairs(id,title,category,applicant_id,description,status,department_id,handler,result,created_at,updated_at)
+        SELECT id,title,category,applicant_id,description,status,department_id,handler,result,created_at,updated_at FROM affairs_legacy;
+        DROP TABLE affairs_legacy;
+        """
+    )
 
 
 def migrate_db() -> None:

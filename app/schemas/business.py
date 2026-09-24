@@ -52,6 +52,27 @@ class UrgeRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=1000)
 
 
+class AffairSubmitRequest(BaseModel):
+    """经办人提交办理结果，受控类别提交后进入“待复核”。"""
+
+    result: str = Field(min_length=1, max_length=4000)
+    department_id: int | None = None
+
+
+class AffairReviewDecisionRequest(BaseModel):
+    """复核人作出复核结论。"""
+
+    approved: bool
+    opinion: str = Field(min_length=1, max_length=2000)
+
+
+class AffairReviewPolicyRequest(BaseModel):
+    """按类别配置职责分离是否生效。"""
+
+    is_active: bool
+    note: str = Field(default="", max_length=500)
+
+
 class MetricWindowRequest(BaseModel):
     started_at: str | None = None
     ended_at: str | None = None
